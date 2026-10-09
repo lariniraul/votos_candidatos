@@ -18,6 +18,24 @@ def fixture():
 
 
 class DataTests(unittest.TestCase):
+    def test_preparation_only_selected_cargo_and_reused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture().to_csv(root / "secoes.csv", sep=";", index=False)
+            fixture().assign(CD_CARGO="1", NR_VOTAVEL="11").to_csv(root / "secoes_presidente.csv", sep=";", index=False)
+            with patch.object(app, "DATA", root):
+                ready, errors, stamp = app.prepare_cargo("6", fetch=False)
+                self.assertIn(("secoes", False), ready)
+                self.assertNotIn(("secoes_presidente", True), ready)
+                self.assertEqual(len(list((root / "indices").glob("*.sqlite"))), 1)
+                self.assertTrue(errors)  # Optional sources absent, no fabricated mapping.
+                with patch.object(app, "chunks", side_effect=AssertionError("Não deve reler")):
+                    ready2, _, stamp2 = app.prepare_cargo("6", fetch=False)
+                self.assertEqual(ready, ready2)
+                self.assertEqual(stamp, stamp2)
+                app.prepare_cargo("1", fetch=False)
+                self.assertEqual(len(list((root / "indices").glob("*.sqlite"))), 2)
+
     def test_index_matches_original_and_reuses_source(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "votes.csv"
@@ -152,6 +170,9 @@ class DataTests(unittest.TestCase):
         at = AppTest.from_file(str(Path(app.__file__))).run()
         self.assertFalse(at.exception)
         self.assertIn("Votos por bairro", at.title[0].value)
+        self.assertEqual(len(at.button), 4)
+        self.assertEqual(len(at.text_input), 0)
+        self.assertEqual(len(at.dataframe), 0)
 
     def test_streamlit_populated_flow(self):
         # Use an isolated copy so fixture files cannot be mistaken for live data.
@@ -162,6 +183,8 @@ class DataTests(unittest.TestCase):
             (root / "data").mkdir()
             fixture().to_csv(root / "data" / "secoes.csv", sep=";", index=False, encoding="latin-1")
             at = AppTest.from_file(str(root / "app.py")).run()
+            with patch("requests.get", side_effect=app.requests.ConnectionError("Teste offline")):
+                at.button(key="cargo_6").click().run(timeout=20)
             at.text_input[0].set_value("1234").run()
             self.assertFalse(at.exception)
             self.assertEqual(len(at.dataframe), 4)
@@ -182,11 +205,27 @@ class DataTests(unittest.TestCase):
                 data.to_csv(root / "data" / (name + ".csv"), sep=";", index=False, encoding="latin-1")
             at = AppTest.from_file(str(root / "app.py")).run()
             for label, (cargo, digits) in app.CARGOS.items():
-                at.selectbox(key="cargo").select(label).run()
+                with patch("requests.get", side_effect=app.requests.ConnectionError("Teste offline")):
+                    at.button(key=f"cargo_{cargo}").click().run(timeout=20)
                 at.text_input(key=f"numero_{cargo}").set_value("1" * digits).run()
                 self.assertFalse(at.exception)
                 self.assertEqual(at.metric[0].value, "10")
                 self.assertEqual(len(at.dataframe), 4)
+            # Returning to a prepared office must neither download nor rebuild it.
+            with patch("requests.get", side_effect=AssertionError("Não deve baixar")):
+                at.button(key="cargo_6").click().run()
+            self.assertFalse(at.exception)
+            self.assertEqual(at.text_input(key="numero_6").value, "1111")
+
+    def test_index_contains_only_clicked_office(self):
+        import sqlite3
+        from contextlib import closing
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "votes.csv"
+            pd.concat([fixture(), fixture().assign(CD_CARGO="7")]).to_csv(path, sep=";", index=False)
+            database = app.prepare_index(path, "votes", cargo="6")
+            with closing(sqlite3.connect(database)) as conn:
+                self.assertEqual(conn.execute("SELECT DISTINCT CD_CARGO FROM records").fetchall(), [("6",)])
 
 
 if __name__ == "__main__":

@@ -127,15 +127,15 @@ def vote_int(values):
     return values.astype("int64")
 
 
-def prepare_index(path, kind, presidential=False):
+def prepare_index(path, kind, presidential=False, cargo="6"):
     """Cache persistente e indexado; cada versão da fonte é lida uma vez.
 
     A preparação usa blocos; o SQLite guarda os votos em disco, não na RAM.
     Duplicidades são preservadas para a validação da consulta, nunca somadas.
     """
     stamp = path.stat()
-    identity = ["index-v1", str(path.resolve()), stamp.st_mtime_ns,
-                stamp.st_size, kind, presidential]
+    identity = ["index-v2-cargo", str(path.resolve()), stamp.st_mtime_ns,
+                stamp.st_size, kind, presidential, cargo]
     key = hashlib.sha256(json.dumps(identity).encode()).hexdigest()[:24]
     folder = path.parent / "indices"
     folder.mkdir(exist_ok=True)
@@ -156,7 +156,7 @@ def prepare_index(path, kind, presidential=False):
         for raw in chunks(path, presidential, set(common + extra)):
             f = normalize(raw)
             require(f, ["ANO_ELEICAO", "SG_UF", "CD_CARGO", "NR_TURNO", "CD_ELEICAO"])
-            f = f[(f.SG_UF == "SP") & (f.ANO_ELEICAO == "2026") & f.CD_CARGO.isin(["1", "5", "6", "7"])].copy()
+            f = f[(f.SG_UF == "SP") & (f.ANO_ELEICAO == "2026") & (f.CD_CARGO == cargo)].copy()
             if kind == "votes":
                 require(f, SECTION + ["NM_MUNICIPIO", "NR_VOTAVEL", "QT_VOTOS"])
                 if "NR_LOCAL_VOTACAO" not in f:
@@ -191,7 +191,7 @@ def prepare_index(path, kind, presidential=False):
 
 
 def read_votes_indexed(path, number, cargo="6", turno="1"):
-    database = prepare_index(path, "votes", cargo == "1")
+    database = prepare_index(path, "votes", cargo == "1", cargo)
     with closing(sqlite3.connect(database)) as conn:
         places = pd.read_sql_query("SELECT * FROM places WHERE CD_CARGO=? AND NR_TURNO=?", conn, params=(cargo, turno))
         elections = places.CD_ELEICAO.unique()
@@ -283,7 +283,7 @@ def attach_mapping(votes, mapping=None):
 def read_totals(path, number, election, cargo="6", turno="1", indexed=False):
     rows = []
     if indexed:
-        database = prepare_index(path, "totals", cargo == "1")
+        database = prepare_index(path, "totals", cargo == "1", cargo)
         with closing(sqlite3.connect(database)) as conn:
             source = [pd.read_sql_query("SELECT * FROM records WHERE CD_CARGO=? AND NR_TURNO=? AND NR_CANDIDATO=? AND CD_ELEICAO=?", conn, params=(cargo, turno, number, election))]
     else:
@@ -346,6 +346,40 @@ def cached_mapping(path, stamp, size, turno):
     return read_mapping(Path(path), turno)
 
 
+def source_signature(cargo="6"):
+    return tuple((k, str(p), p.stat().st_mtime_ns, p.stat().st_size)
+                 for k in [section_source(cargo), "locais", "totais"] if (p := existing(k)))
+
+
+def prepare_cargo(cargo, progress=lambda message: None, refresh=False, fetch=True):
+    """Prepara apenas o cargo escolhido; arquivos comuns são reaproveitados."""
+    ready, errors = set(), []
+    for kind in [section_source(cargo), "locais", "totais"]:
+        if refresh or (fetch and not existing(kind)):
+            progress(f"Obtendo {kind} no TSE…")
+            try:
+                download(kind)
+            except (requests.RequestException, OSError, ValueError, zipfile.BadZipFile) as exc:
+                errors.append(f"{kind}: atualização indisponível ({exc}).")
+        path = existing(kind)
+        if path is None:
+            errors.append(f"{kind}: arquivo ausente.")
+            continue
+        variants = [cargo == "1" if kind != "locais" else False]
+        for presidential in variants:
+            progress(f"Preparando {kind}" + (" — Presidente…" if presidential else "…"))
+            try:
+                if kind == "locais":
+                    for turno in (["1", "2"] if cargo == "1" else ["1"]):
+                        cached_mapping(str(path), path.stat().st_mtime_ns, path.stat().st_size, turno)
+                else:
+                    prepare_index(path, "totals" if kind == "totais" else "votes", presidential, cargo)
+                ready.add((kind, presidential))
+            except (ValueError, OSError, sqlite3.Error, zipfile.BadZipFile) as exc:
+                errors.append(f"{kind}: preparação indisponível ({exc}).")
+    return ready, errors, source_signature(cargo)
+
+
 @st.cache_data(show_spinner=False, max_entries=8)
 def load_cached(number, signature, cargo="6", turno="1"):
     paths = {k: Path(p) for k, p, _, _ in signature}
@@ -375,30 +409,57 @@ def main():
     st.set_page_config(page_title="Votos por bairro • SP 2026", page_icon="🗳️", layout="wide")
     st.title("Votos por bairro · São Paulo")
     st.info("Bairro do local de votação, não de residência dos eleitores. Sem inferência por endereço ou nome de escola.")
+    st.caption("Clique em um cargo para carregar sua base. Os cargos já consultados ficam guardados.")
+    preparations = st.session_state.setdefault("bases_por_cargo", {})
+    clicked = None
+    for column, (name, (code, _)) in zip(st.columns(4), CARGOS.items()):
+        if column.button(name, key=f"cargo_{code}", type="primary" if st.session_state.get("cargo_ativo") == name else "secondary"):
+            clicked = name
+    if clicked:
+        st.session_state.cargo_ativo = clicked
+        code = CARGOS[clicked][0]
+        stored = preparations.get(code)
+        if stored is None or stored[2] != source_signature(code):
+            with st.status(f"Preparando {clicked}…", expanded=True) as status:
+                preparations[code] = prepare_cargo(code, status.write)
+                available = (section_source(code), code == "1") in preparations[code][0]
+                status.update(label=f"{clicked}: base pronta" if available else f"{clicked}: base indisponível", state="complete" if available else "error", expanded=False)
+    label = st.session_state.get("cargo_ativo")
+    if label is None:
+        st.info("Escolha um dos quatro cargos acima para começar.")
+        return
+    cargo, digits = CARGOS[label]
     with st.sidebar:
-        st.header("Consulta")
-        label = st.selectbox("Cargo", list(CARGOS), index=2, key="cargo")
-        cargo, digits = CARGOS[label]
-        turno = st.selectbox("Turno", ["1", "2"], format_func=lambda x: f"{x}º turno", key="turno") if cargo == "1" else "1"
+        st.header(label)
+        if st.button("Atualizar / tentar novamente este cargo", key="atualizar_cargo"):
+            with st.status(f"Atualizando {label}…") as status:
+                preparations[cargo] = prepare_cargo(cargo, status.write, refresh=True)
+                status.update(label="Atualização encerrada", state="complete")
+        preparation = preparations.get(cargo)
+        enabled = bool(preparation) and preparation[2] == source_signature(cargo)
+        if preparation and not enabled:
+            st.warning("Os arquivos mudaram. Clique novamente no botão deste cargo.")
+        if enabled:
+            st.caption("A base deste cargo será reutilizada ao trocar de candidato.")
+            for message in preparation[1]:
+                st.warning(message)
+        turno = st.selectbox("Turno", ["1", "2"], format_func=lambda x: f"{x}º turno", key="turno", disabled=not enabled) if cargo == "1" else "1"
+        numbers = st.session_state.setdefault("numeros_guardados", {})
+        st.session_state.setdefault(f"numero_{cargo}", numbers.get(cargo, ""))
         number = st.text_input(f"Número do candidato ({digits} dígitos)",
-                               placeholder=f"Digite os {digits} dígitos", key=f"numero_{cargo}").strip()
+                               placeholder=f"Digite os {digits} dígitos", key=f"numero_{cargo}", disabled=not enabled).strip()
+        numbers[cargo] = number
         source = section_source(cargo)
         needed = [source, "locais", "totais"]
         st.caption("O número deve corresponder à candidatura de 2026. O app não presume a identidade da pessoa.")
-        if st.button("Baixar / atualizar arquivos do TSE"):
-            for kind in needed:
-                with st.spinner(f"Baixando {kind} — pode demorar vários minutos…"):
-                    try:
-                        download(kind)
-                        st.success(f"{kind}: atualizado")
-                    except (requests.RequestException, OSError, ValueError, zipfile.BadZipFile) as exc:
-                        st.warning(f"{kind}: indisponível. {exc}")
-            load_cached.clear()
         st.caption("Arquivos grandes. Também é possível colocar CSVs/ZIPs oficiais na pasta data; consulte o README.")
         for kind in needed:
             url = PAGES[kind]
             st.markdown(f"[Fonte TSE — {kind}]({url})")
     st.caption(f"Eleições 2026 · {label} · {turno}º turno · São Paulo · Fonte: TSE")
+    if not enabled:
+        st.info("Clique no botão do cargo para preparar seus dados.")
+        return
     if cargo == "1":
         st.info("Presidente: apenas votos registrados em São Paulo. Turnos sem dados publicados aparecem como indisponíveis.")
     with st.expander("Fontes e rastreabilidade"):
@@ -409,16 +470,16 @@ def main():
                 st.json(json.loads(path.with_suffix(".json").read_text(encoding="utf-8")))
             elif path:
                 st.caption("Importação local: autenticidade e integridade do arquivo não certificadas pelo app.")
-    if not existing(source):
-        st.warning("Resultados indisponíveis localmente. Baixe os arquivos oficiais para começar. Nenhum voto foi estimado.")
+    if (source, cargo == "1") not in preparation[0]:
+        st.warning("Base deste cargo indisponível. Os demais cargos preparados continuam acessíveis. Nenhum voto foi estimado.")
         return
     if not valid_number(number, digits):
         st.info(f"Informe um número de candidato com {digits} dígitos para {label}.")
         return
     signature = tuple((k, str(p), p.stat().st_mtime_ns, p.stat().st_size)
-                      for k in needed if (p := existing(k)))
+                      for k in needed if (k, cargo == "1" if k != "locais" else False) in preparation[0] and (p := existing(k)))
     try:
-        with st.spinner("Consultando dados — na primeira consulta, preparando a base rápida em disco…"):
+        with st.spinner("Consultando a base preparada…"):
             votes, check, dates, found, warnings = load_cached(number, signature, cargo, turno)
     except (ValueError, OSError, zipfile.BadZipFile) as exc:
         st.error("Consulta bloqueada por inconsistência nos dados: " + str(exc))
