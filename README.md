@@ -1,6 +1,6 @@
 # Votos por bairro — SP 2026
 
-App Streamlit para deputado federal, São Paulo, primeiro turno de 2026. Consulta por número de quatro dígitos, lista de cidades, seleção de cidade, bairros, escolas/locais, seções e exportações CSV UTF-8 com BOM (separador `;`). Não inclui votos de exemplo na aplicação.
+App Streamlit para Presidente, deputado estadual, deputado federal e senador em 2026, com resultados restritos a São Paulo. Menu de cargo e consulta por número com tamanho adequado, lista de cidades, seleção de cidade, bairros, escolas/locais, seções e exportações CSV UTF-8 com BOM (separador `;`). Não inclui votos de exemplo na aplicação.
 
 ## Executar
 
@@ -24,7 +24,7 @@ No Linux/macOS:
 .venv/bin/python -m streamlit run app.py
 ```
 
-Abra o endereço local mostrado pelo Streamlit. Clique em **Baixar / atualizar arquivos do TSE**, aguarde os três arquivos e informe o número. Escolha a cidade e depois um bairro para ver escolas e seções. A aplicação mantém os arquivos na pasta `data` ao lado de `app.py`; downloads podem ser grandes e demorar. Reserve alguns GB de disco e memória. A leitura é feita em blocos de 100 mil linhas, mas o arquivo de seções precisa ser percorrido integralmente em cada nova consulta não armazenada em cache.
+Abra o endereço local mostrado pelo Streamlit. Clique em **Baixar / atualizar arquivos do TSE**, aguarde os três arquivos do cargo selecionado e informe o número. Escolha a cidade e depois um bairro para ver escolas e seções. A aplicação mantém os arquivos na pasta `data` ao lado de `app.py`; downloads podem ser grandes e demorar. Reserve alguns GB de disco e memória. A leitura é feita em blocos de 100 mil linhas, mas o arquivo de seções precisa ser percorrido integralmente em cada nova consulta não armazenada em cache.
 
 ## Fontes oficiais verificáveis
 
@@ -69,4 +69,14 @@ Os testes usam dados sintéticos isolados em arquivos temporários: filtros, zer
 
 ## Verificação desta entrega
 
-Em 09/10/2026: 13 testes passaram (incluindo interface vazia e navegação com dados sintéticos). Ambiente: Python 3.13.2, pandas 2.3.3, Streamlit 1.65.0 e requests 2.34.2. Os três links diretos responderam HTTP 200; cabeçalhos foram inspecionados em pequenas amostras dos ZIPs oficiais. Não foi realizada nesta entrega a carga integral e conciliação dos votos reais. A aplicação faz essa conferência após baixar os arquivos.
+Em 09/10/2026: 17 testes passaram (incluindo interface vazia e navegação com dados sintéticos). Ambiente: Python 3.13.2, pandas 2.3.3, Streamlit 1.65.0 e requests 2.34.2. Os três links diretos responderam HTTP 200; cabeçalhos foram inspecionados em pequenas amostras dos ZIPs oficiais. Não foi realizada nesta entrega a carga integral e conciliação dos votos reais. A aplicação faz essa conferência após baixar os arquivos.
+
+## Menu de cargos
+
+Escolha o cargo na barra lateral antes de informar o número. Presidente usa 2 dígitos, deputado estadual 5, deputado federal 4 e senador 3. O número de cada cargo é mantido separadamente; os filtros e o cache incluem cargo e turno para não misturar consultas. Os resultados continuam nas tabelas da tela; CSV é opcional.
+
+Presidente usa o recurso nacional de seções do TSE, filtrando SG_UF=SP, e o membro BR/BRASIL da totalização. Para importação manual, salve a votação presidencial em data/secoes_presidente.zip (ou .csv). O cadastro de locais é filtrado pelo turno selecionado. Não há substituição por cadastro de outro turno: se não houver vínculo, o bairro fica Não identificado. Deputados e senador continuam usando data/secoes.zip. O botão de atualização busca somente a base de seções do cargo selecionado, locais e totais. Turnos sem resultados disponíveis não exibem estimativas.
+
+Fonte presidencial: https://dadosabertos.tse.jus.br/dataset/resultados-2026 (recurso Presidente — Votação por seção eleitoral — 2026). URL: https://cdn.tse.jus.br/estatistica/sead/odsele/votacao_secao/votacao_secao_2026_BR.zip . A seleção de BR tem prioridade sobre SP apenas na leitura presidencial.
+
+Os 17 testes incluem filtros dos quatro cargos, exclusão de outras UFs/turnos, segundo turno presidencial, seleção do membro BR para totais e troca de cargos na interface. A extensão presidencial foi testada com dados sintéticos; a carga integral dos dados reais continua não realizada nesta entrega.

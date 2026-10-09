@@ -1,4 +1,4 @@
-"""Eleições 2026 / SP / deputado federal. Execute: streamlit run app.py."""
+"""Eleições 2026 / SP / consulta por cargo. Execute: streamlit run app.py."""
 from pathlib import Path
 from datetime import datetime, timezone
 import hashlib
@@ -15,11 +15,13 @@ DATA = ROOT / "data"
 UNKNOWN = "Não identificado"
 BASE = "https://cdn.tse.jus.br/estatistica/sead/odsele/"
 SOURCES = {
+    "secoes_presidente": BASE + "votacao_secao/votacao_secao_2026_BR.zip",
     "secoes": BASE + "votacao_secao/votacao_secao_2026_SP.zip",
     "locais": BASE + "eleitorado_locais_votacao/eleitorado_local_votacao_2026.zip",
     "totais": BASE + "votacao_candidato_munzona/votacao_candidato_munzona_2026.zip",
 }
 PAGES = {
+    "secoes_presidente": "https://dadosabertos.tse.jus.br/dataset/resultados-2026",
     "secoes": "https://dadosabertos.tse.jus.br/dataset/resultados-2026/resource/30378d01-7c4a-43a8-84c8-4fc7499a9efe",
     "locais": "https://dadosabertos.tse.jus.br/dataset/eleitorado-2026/resource/300626b4-2b24-4d2e-b4fc-46b569cfffe5",
     "totais": "https://dadosabertos.tse.jus.br/dataset/resultados-2026/resource/c807b826-21ff-4bcf-97ca-d86482656320",
@@ -27,6 +29,20 @@ PAGES = {
 ZONE = ["CD_MUNICIPIO", "NR_ZONA"]
 SECTION = ZONE + ["NR_SECAO"]
 LOCAL = ZONE + ["NR_LOCAL_VOTACAO"]
+CARGOS = {
+    "Presidente": ("1", 2),
+    "Deputado estadual": ("7", 5),
+    "Deputado federal": ("6", 4),
+    "Senador": ("5", 3),
+}
+
+
+def section_source(cargo):
+    return "secoes_presidente" if cargo == "1" else "secoes"
+
+
+def valid_number(number, digits):
+    return bool(re.fullmatch(rf"[0-9]{{{digits}}}", number))
 
 
 def download(kind):
@@ -55,7 +71,7 @@ def download(kind):
     return path
 
 
-def chunks(path):
+def chunks(path, presidential=False):
     """Lê sem extrair ZIP; prefere membro SP para não duplicar BR e UFs."""
     def reader(handle):
         return pd.read_csv(handle, sep=";", encoding="latin-1", dtype=str,
@@ -66,8 +82,8 @@ def chunks(path):
     with zipfile.ZipFile(path) as archive:
         names = [n for n in archive.namelist() if n.lower().endswith(".csv")]
         sp = [n for n in names if Path(n).stem.upper().endswith("_SP")]
-        br = [n for n in names if Path(n).stem.upper().endswith("_BRASIL")]
-        selected = sp or br or names
+        br = [n for n in names if Path(n).stem.upper().endswith(("_BR", "_BRASIL"))]
+        selected = (br or sp or names) if presidential else (sp or br or names)
         if len(selected) != 1:
             raise ValueError("ZIP ambíguo: use o CSV de SP ou um único CSV nacional.")
         with archive.open(selected[0]) as handle:
@@ -90,13 +106,13 @@ def normalize(frame):
     return frame
 
 
-def scope(frame, election=True):
+def scope(frame, election=True, cargo="6", turno="1"):
     require(frame, ["SG_UF", "ANO_ELEICAO"] if election else ["SG_UF", "AA_ELEICAO"])
     year = "ANO_ELEICAO" if election else "AA_ELEICAO"
     keep = (frame.SG_UF == "SP") & (frame[year] == "2026")
     if election:
         require(frame, ["CD_CARGO", "NR_TURNO", "CD_ELEICAO"])
-        keep &= (frame.CD_CARGO == "6") & (frame.NR_TURNO == "1")
+        keep &= (frame.CD_CARGO == cargo) & (frame.NR_TURNO == turno)
     return frame.loc[keep].copy()
 
 
@@ -106,10 +122,10 @@ def vote_int(values):
     return values.astype("int64")
 
 
-def read_votes(path, number):
+def read_votes(path, number, cargo="6", turno="1"):
     rows, universe, elections, dates = [], [], set(), set()
-    for raw in chunks(path):
-        f = scope(normalize(raw))
+    for raw in chunks(path, presidential=cargo == "1"):
+        f = scope(normalize(raw), cargo=cargo, turno=turno)
         require(f, SECTION + ["NM_MUNICIPIO", "NR_VOTAVEL", "QT_VOTOS"])
         elections.update(f.CD_ELEICAO.unique())
         if "DT_GERACAO" in f:
@@ -139,7 +155,7 @@ def clean_label(series):
         "#NE#": UNKNOWN, "#NULO": UNKNOWN, "#NE": UNKNOWN, "-1": UNKNOWN, "-3": UNKNOWN})
 
 
-def read_mapping(path):
+def read_mapping(path, turno="1"):
     rows = []
     for raw in chunks(path):
         f = normalize(raw)
@@ -148,7 +164,7 @@ def read_mapping(path):
             f = f.rename(columns={"ANO_ELEICAO": "AA_ELEICAO"})
         f = scope(f, election=False)
         if "NR_TURNO" in f:
-            f = f[f.NR_TURNO == "1"]
+            f = f[f.NR_TURNO == turno]
         require(f, LOCAL)
         for source, target in [("NM_BAIRRO", "Bairro"), ("NM_LOCAL_VOTACAO", "Escola")]:
             f[target] = clean_label(f[source]) if source in f else UNKNOWN
@@ -176,10 +192,10 @@ def attach_mapping(votes, mapping=None):
     return result
 
 
-def read_totals(path, number, election):
+def read_totals(path, number, election, cargo="6", turno="1"):
     rows = []
-    for raw in chunks(path):
-        f = scope(normalize(raw))
+    for raw in chunks(path, presidential=cargo == "1"):
+        f = scope(normalize(raw), cargo=cargo, turno=turno)
         require(f, ZONE + ["NR_CANDIDATO", "QT_VOTOS_NOMINAIS"])
         f = f[(f.NR_CANDIDATO == number) & (f.CD_ELEICAO == election)].copy()
         f["Oficial"] = vote_int(f.QT_VOTOS_NOMINAIS)
@@ -232,13 +248,13 @@ def existing(kind):
 
 
 @st.cache_data(show_spinner=False)
-def load_cached(number, signature):
+def load_cached(number, signature, cargo="6", turno="1"):
     paths = {k: Path(p) for k, p, _, _ in signature}
-    votes, election, dates, found = read_votes(paths["secoes"], number)
+    votes, election, dates, found = read_votes(paths[section_source(cargo)], number, cargo, turno)
     warnings, mapping = [], None
     if "locais" in paths:
         try:
-            mapping, conflicts = read_mapping(paths["locais"])
+            mapping, conflicts = read_mapping(paths["locais"], turno)
             if conflicts:
                 warnings.append(f"{conflicts} locais conflitantes: Não identificado.")
         except (ValueError, OSError, zipfile.BadZipFile) as exc:
@@ -249,7 +265,7 @@ def load_cached(number, signature):
     check = None
     if "totais" in paths:
         try:
-            check = reconcile(votes, read_totals(paths["totais"], number, election))
+            check = reconcile(votes, read_totals(paths["totais"], number, election, cargo, turno))
         except (ValueError, OSError, zipfile.BadZipFile) as exc:
             warnings.append("Total oficial não validado: " + str(exc))
     return votes, check, dates, found, warnings
@@ -258,14 +274,19 @@ def load_cached(number, signature):
 def main():
     st.set_page_config(page_title="Votos por bairro • SP 2026", page_icon="🗳️", layout="wide")
     st.title("Votos por bairro · São Paulo")
-    st.caption("Eleições 2026 · Deputado federal · Primeiro turno · Fonte: TSE")
     st.info("Bairro do local de votação, não de residência dos eleitores. Sem inferência por endereço ou nome de escola.")
     with st.sidebar:
         st.header("Consulta")
-        number = st.text_input("Número do candidato (4 dígitos)", placeholder="Ex.: 3034").strip()
+        label = st.selectbox("Cargo", list(CARGOS), index=2, key="cargo")
+        cargo, digits = CARGOS[label]
+        turno = st.selectbox("Turno", ["1", "2"], format_func=lambda x: f"{x}º turno", key="turno") if cargo == "1" else "1"
+        number = st.text_input(f"Número do candidato ({digits} dígitos)",
+                               placeholder=f"Digite os {digits} dígitos", key=f"numero_{cargo}").strip()
+        source = section_source(cargo)
+        needed = [source, "locais", "totais"]
         st.caption("O número deve corresponder à candidatura de 2026. O app não presume a identidade da pessoa.")
         if st.button("Baixar / atualizar arquivos do TSE"):
-            for kind in SOURCES:
+            for kind in needed:
                 with st.spinner(f"Baixando {kind} — pode demorar vários minutos…"):
                     try:
                         download(kind)
@@ -274,27 +295,31 @@ def main():
                         st.warning(f"{kind}: indisponível. {exc}")
             load_cached.clear()
         st.caption("Arquivos grandes. Também é possível colocar CSVs/ZIPs oficiais na pasta data; consulte o README.")
-        for kind, url in PAGES.items():
+        for kind in needed:
+            url = PAGES[kind]
             st.markdown(f"[Fonte TSE — {kind}]({url})")
+    st.caption(f"Eleições 2026 · {label} · {turno}º turno · São Paulo · Fonte: TSE")
+    if cargo == "1":
+        st.info("Presidente: apenas votos registrados em São Paulo. Turnos sem dados publicados aparecem como indisponíveis.")
     with st.expander("Fontes e rastreabilidade"):
-        for kind in SOURCES:
+        for kind in needed:
             path = existing(kind)
             st.write(f"{kind}: {path.name if path else 'não disponível'}")
             if path and path.with_suffix(".json").exists():
                 st.json(json.loads(path.with_suffix(".json").read_text(encoding="utf-8")))
             elif path:
                 st.caption("Importação local: autenticidade e integridade do arquivo não certificadas pelo app.")
-    if not existing("secoes"):
+    if not existing(source):
         st.warning("Resultados indisponíveis localmente. Baixe os arquivos oficiais para começar. Nenhum voto foi estimado.")
         return
-    if not re.fullmatch(r"\d{4}", number):
-        st.info("Informe um número de candidato com quatro dígitos.")
+    if not valid_number(number, digits):
+        st.info(f"Informe um número de candidato com {digits} dígitos para {label}.")
         return
     signature = tuple((k, str(p), p.stat().st_mtime_ns, p.stat().st_size)
-                      for k in SOURCES if (p := existing(k)))
+                      for k in needed if (p := existing(k)))
     try:
         with st.spinner("Lendo os dados oficiais em blocos…"):
-            votes, check, dates, found, warnings = load_cached(number, signature)
+            votes, check, dates, found, warnings = load_cached(number, signature, cargo, turno)
     except (ValueError, OSError, zipfile.BadZipFile) as exc:
         st.error("Consulta bloqueada por inconsistência nos dados: " + str(exc))
         return

@@ -18,6 +18,33 @@ def fixture():
 
 
 class DataTests(unittest.TestCase):
+    def test_each_office_and_turn_filters(self):
+        for label, (cargo, digits) in app.CARGOS.items():
+            number = "1" * digits
+            good = fixture().iloc[[0]].assign(CD_CARGO=cargo, NR_VOTAVEL=number)
+            mixed = pd.concat([good, good.assign(SG_UF="RJ"), good.assign(NR_TURNO="2"),
+                               good.assign(CD_CARGO="99")])
+            with patch.object(app, "chunks", return_value=iter([mixed])):
+                result = app.read_votes(Path("unused"), number, cargo)[0]
+            self.assertEqual(result.Votos.sum(), 10, label)
+            self.assertTrue(app.valid_number(number, digits))
+            self.assertFalse(app.valid_number(number + "0", digits))
+
+    def test_presidential_zip_uses_br_and_filters_sp(self):
+        import zipfile
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "totais.zip"
+            base = fixture().iloc[[0]].assign(CD_CARGO="1", NR_CANDIDATO="11", QT_VOTOS_NOMINAIS="10")
+            with zipfile.ZipFile(path, "w") as z:
+                z.writestr("totais_SP.csv", base.assign(CD_CARGO="6").to_csv(index=False, sep=";"))
+                z.writestr("totais_BR.csv", pd.concat([base, base.assign(SG_UF="RJ")]).to_csv(index=False, sep=";"))
+            self.assertEqual(app.read_totals(path, "11", "999", "1").Oficial.sum(), 10)
+
+    def test_president_second_turn(self):
+        f = fixture().iloc[[0]].assign(CD_CARGO="1", NR_VOTAVEL="11", NR_TURNO="2")
+        with patch.object(app, "chunks", return_value=iter([f])):
+            self.assertEqual(app.read_votes(Path("unused"), "11", "1", "2")[0].Votos.sum(), 10)
+
     def read(self, frame):
         with patch.object(app, "chunks", return_value=iter([frame])):
             return app.read_votes(Path("unused"), "1234")
@@ -109,8 +136,27 @@ class DataTests(unittest.TestCase):
             self.assertFalse(at.exception)
             self.assertEqual(len(at.dataframe), 4)
             self.assertEqual(at.metric[0].value, "30")
-            at.selectbox[1].select(app.UNKNOWN).run()
+            next(s for s in at.selectbox if s.label == "Detalhar bairro").select(app.UNKNOWN).run()
             self.assertFalse(at.exception)
+
+    def test_menu_switches_offices(self):
+        import shutil
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shutil.copy(app.__file__, root / "app.py")
+            (root / "data").mkdir()
+            frames = [fixture().iloc[[0]].assign(CD_CARGO=c, NR_VOTAVEL="1" * d)
+                      for c, d in app.CARGOS.values()]
+            data = pd.concat(frames)
+            for name in ["secoes", "secoes_presidente"]:
+                data.to_csv(root / "data" / (name + ".csv"), sep=";", index=False, encoding="latin-1")
+            at = AppTest.from_file(str(root / "app.py")).run()
+            for label, (cargo, digits) in app.CARGOS.items():
+                at.selectbox(key="cargo").select(label).run()
+                at.text_input(key=f"numero_{cargo}").set_value("1" * digits).run()
+                self.assertFalse(at.exception)
+                self.assertEqual(at.metric[0].value, "10")
+                self.assertEqual(len(at.dataframe), 4)
 
 
 if __name__ == "__main__":
