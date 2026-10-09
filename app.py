@@ -5,6 +5,10 @@ import hashlib
 import json
 import re
 import zipfile
+import sqlite3
+import tempfile
+import os
+from contextlib import closing
 
 import pandas as pd
 import requests
@@ -71,11 +75,12 @@ def download(kind):
     return path
 
 
-def chunks(path, presidential=False):
+def chunks(path, presidential=False, columns=None):
     """Lê sem extrair ZIP; prefere membro SP para não duplicar BR e UFs."""
     def reader(handle):
         return pd.read_csv(handle, sep=";", encoding="latin-1", dtype=str,
-                           keep_default_na=False, chunksize=100_000)
+                           keep_default_na=False, chunksize=100_000,
+                           usecols=(lambda c: c.strip().lstrip("\ufeff").removeprefix("ï»¿") in columns) if columns else None)
     if path.suffix.lower() == ".csv":
         yield from reader(path)
         return
@@ -120,6 +125,89 @@ def vote_int(values):
     if not values.str.fullmatch(r"\d+").all():
         raise ValueError("Contagem de votos inválida ou negativa.")
     return values.astype("int64")
+
+
+def prepare_index(path, kind, presidential=False):
+    """Cache persistente e indexado; cada versão da fonte é lida uma vez.
+
+    A preparação usa blocos; o SQLite guarda os votos em disco, não na RAM.
+    Duplicidades são preservadas para a validação da consulta, nunca somadas.
+    """
+    stamp = path.stat()
+    identity = ["index-v1", str(path.resolve()), stamp.st_mtime_ns,
+                stamp.st_size, kind, presidential]
+    key = hashlib.sha256(json.dumps(identity).encode()).hexdigest()[:24]
+    folder = path.parent / "indices"
+    folder.mkdir(exist_ok=True)
+    target = folder / f"{key}.sqlite"
+    if target.exists():
+        return target
+    common = SECTION + ["ANO_ELEICAO", "SG_UF", "CD_CARGO", "NR_TURNO", "CD_ELEICAO"]
+    extra = (["NR_VOTAVEL", "QT_VOTOS", "NM_MUNICIPIO", "NR_LOCAL_VOTACAO", "NM_LOCAL_VOTACAO", "DT_GERACAO"]
+             if kind == "votes" else ["NR_CANDIDATO", "QT_VOTOS_NOMINAIS", "SQ_CANDIDATO", "ST_VOTO_EM_TRANSITO", "NM_TIPO_DESTINACAO_VOTOS"])
+    descriptor, name = tempfile.mkstemp(prefix="preparando-", suffix=".sqlite", dir=folder)
+    os.close(descriptor)
+    temp = Path(name)
+    connection = None
+    try:
+        connection = sqlite3.connect(temp)
+        connection.execute("PRAGMA temp_store=FILE")
+        wrote = False
+        for raw in chunks(path, presidential, set(common + extra)):
+            f = normalize(raw)
+            require(f, ["ANO_ELEICAO", "SG_UF", "CD_CARGO", "NR_TURNO", "CD_ELEICAO"])
+            f = f[(f.SG_UF == "SP") & (f.ANO_ELEICAO == "2026") & f.CD_CARGO.isin(["1", "5", "6", "7"])].copy()
+            if kind == "votes":
+                require(f, SECTION + ["NM_MUNICIPIO", "NR_VOTAVEL", "QT_VOTOS"])
+                if "NR_LOCAL_VOTACAO" not in f:
+                    f["NR_LOCAL_VOTACAO"] = ""
+                f["Escola_secoes"] = clean_label(f.NM_LOCAL_VOTACAO) if "NM_LOCAL_VOTACAO" in f else UNKNOWN
+            else:
+                require(f, ZONE + ["NR_CANDIDATO", "QT_VOTOS_NOMINAIS"])
+            f.to_sql("records", connection, if_exists="append", index=False, chunksize=5000)
+            wrote = True
+        if not wrote:
+            raise ValueError("Arquivo sem cabeçalho ou registros.")
+        candidate = "NR_VOTAVEL" if kind == "votes" else "NR_CANDIDATO"
+        connection.execute(f'CREATE INDEX consulta ON records (CD_CARGO, NR_TURNO, "{candidate}", CD_ELEICAO)')
+        if kind == "votes":
+            cols = ["CD_CARGO", "NR_TURNO", "CD_ELEICAO"] + SECTION + ["NM_MUNICIPIO", "NR_LOCAL_VOTACAO", "Escola_secoes"]
+            connection.execute('CREATE TABLE places AS SELECT DISTINCT ' + ','.join('"'+c+'"' for c in cols) + ' FROM records')
+            connection.execute("CREATE INDEX territorio ON places (CD_CARGO, NR_TURNO)")
+            record_cols = {r[1] for r in connection.execute("PRAGMA table_info(records)")}
+            date_col = 'DT_GERACAO' if "DT_GERACAO" in record_cols else "'' AS DT_GERACAO"
+            connection.execute("CREATE TABLE generations AS SELECT DISTINCT CD_CARGO, NR_TURNO, " + date_col + " FROM records")
+        connection.commit()
+        connection.close()
+        connection = None
+        if (path.stat().st_mtime_ns, path.stat().st_size) != (stamp.st_mtime_ns, stamp.st_size):
+            raise ValueError("Fonte atualizada durante a preparação. Consulte novamente.")
+        temp.replace(target)
+    finally:
+        if connection is not None:
+            connection.close()
+        temp.unlink(missing_ok=True)
+    return target
+
+
+def read_votes_indexed(path, number, cargo="6", turno="1"):
+    database = prepare_index(path, "votes", cargo == "1")
+    with closing(sqlite3.connect(database)) as conn:
+        places = pd.read_sql_query("SELECT * FROM places WHERE CD_CARGO=? AND NR_TURNO=?", conn, params=(cargo, turno))
+        elections = places.CD_ELEICAO.unique()
+        if len(elections) != 1:
+            raise ValueError("Arquivo vazio para o recorte ou contém mais de uma eleição.")
+        hit = pd.read_sql_query("SELECT * FROM records WHERE CD_CARGO=? AND NR_TURNO=? AND NR_VOTAVEL=?", conn, params=(cargo, turno, number))
+        dates = [r[0] for r in conn.execute("SELECT DT_GERACAO FROM generations WHERE CD_CARGO=? AND NR_TURNO=?", (cargo, turno)) if r[0]]
+    if hit.duplicated(SECTION).any():
+        raise ValueError("Votos duplicados para candidato/seção; não serão somados.")
+    if places.duplicated(SECTION).any():
+        raise ValueError("Seção associada a locais ou municípios conflitantes.")
+    hit["Votos"] = vote_int(hit.QT_VOTOS)
+    places = places.drop(columns=["CD_CARGO", "NR_TURNO", "CD_ELEICAO"])
+    result = places.merge(hit[SECTION + ["Votos"]], on=SECTION, how="left", validate="one_to_one")
+    result["Votos"] = result.Votos.fillna(0).astype("int64")
+    return result, elections[0], sorted(dates), not hit.empty
 
 
 def read_votes(path, number, cargo="6", turno="1"):
@@ -192,9 +280,15 @@ def attach_mapping(votes, mapping=None):
     return result
 
 
-def read_totals(path, number, election, cargo="6", turno="1"):
+def read_totals(path, number, election, cargo="6", turno="1", indexed=False):
     rows = []
-    for raw in chunks(path, presidential=cargo == "1"):
+    if indexed:
+        database = prepare_index(path, "totals", cargo == "1")
+        with closing(sqlite3.connect(database)) as conn:
+            source = [pd.read_sql_query("SELECT * FROM records WHERE CD_CARGO=? AND NR_TURNO=? AND NR_CANDIDATO=? AND CD_ELEICAO=?", conn, params=(cargo, turno, number, election))]
+    else:
+        source = chunks(path, presidential=cargo == "1")
+    for raw in source:
         f = scope(normalize(raw), cargo=cargo, turno=turno)
         require(f, ZONE + ["NR_CANDIDATO", "QT_VOTOS_NOMINAIS"])
         f = f[(f.NR_CANDIDATO == number) & (f.CD_ELEICAO == election)].copy()
@@ -247,14 +341,20 @@ def existing(kind):
     return None
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=4)
+def cached_mapping(path, stamp, size, turno):
+    return read_mapping(Path(path), turno)
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
 def load_cached(number, signature, cargo="6", turno="1"):
     paths = {k: Path(p) for k, p, _, _ in signature}
-    votes, election, dates, found = read_votes(paths[section_source(cargo)], number, cargo, turno)
+    votes, election, dates, found = read_votes_indexed(paths[section_source(cargo)], number, cargo, turno)
     warnings, mapping = [], None
     if "locais" in paths:
         try:
-            mapping, conflicts = read_mapping(paths["locais"], turno)
+            p = paths["locais"]
+            mapping, conflicts = cached_mapping(str(p), p.stat().st_mtime_ns, p.stat().st_size, turno)
             if conflicts:
                 warnings.append(f"{conflicts} locais conflitantes: Não identificado.")
         except (ValueError, OSError, zipfile.BadZipFile) as exc:
@@ -265,7 +365,7 @@ def load_cached(number, signature, cargo="6", turno="1"):
     check = None
     if "totais" in paths:
         try:
-            check = reconcile(votes, read_totals(paths["totais"], number, election, cargo, turno))
+            check = reconcile(votes, read_totals(paths["totais"], number, election, cargo, turno, indexed=True))
         except (ValueError, OSError, zipfile.BadZipFile) as exc:
             warnings.append("Total oficial não validado: " + str(exc))
     return votes, check, dates, found, warnings
@@ -318,7 +418,7 @@ def main():
     signature = tuple((k, str(p), p.stat().st_mtime_ns, p.stat().st_size)
                       for k in needed if (p := existing(k)))
     try:
-        with st.spinner("Lendo os dados oficiais em blocos…"):
+        with st.spinner("Consultando dados — na primeira consulta, preparando a base rápida em disco…"):
             votes, check, dates, found, warnings = load_cached(number, signature, cargo, turno)
     except (ValueError, OSError, zipfile.BadZipFile) as exc:
         st.error("Consulta bloqueada por inconsistência nos dados: " + str(exc))

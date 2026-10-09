@@ -24,7 +24,7 @@ No Linux/macOS:
 .venv/bin/python -m streamlit run app.py
 ```
 
-Abra o endereço local mostrado pelo Streamlit. Clique em **Baixar / atualizar arquivos do TSE**, aguarde os três arquivos do cargo selecionado e informe o número. Escolha a cidade e depois um bairro para ver escolas e seções. A aplicação mantém os arquivos na pasta `data` ao lado de `app.py`; downloads podem ser grandes e demorar. Reserve alguns GB de disco e memória. A leitura é feita em blocos de 100 mil linhas, mas o arquivo de seções precisa ser percorrido integralmente em cada nova consulta não armazenada em cache.
+Abra o endereço local mostrado pelo Streamlit. Clique em **Baixar / atualizar arquivos do TSE**, aguarde os três arquivos do cargo selecionado e informe o número. Escolha a cidade e depois um bairro para ver escolas e seções. A aplicação mantém os arquivos na pasta `data` ao lado de `app.py`; downloads podem ser grandes e demorar. Reserve alguns GB de disco e memória. A primeira consulta prepara índices SQLite em disco, em blocos de 100 mil linhas. As consultas seguintes usam esses índices, inclusive para outros candidatos e cargos presentes na mesma fonte, sem percorrer o CSV/ZIP novamente.
 
 ## Fontes oficiais verificáveis
 
@@ -69,7 +69,7 @@ Os testes usam dados sintéticos isolados em arquivos temporários: filtros, zer
 
 ## Verificação desta entrega
 
-Em 09/10/2026: 17 testes passaram (incluindo interface vazia e navegação com dados sintéticos). Ambiente: Python 3.13.2, pandas 2.3.3, Streamlit 1.65.0 e requests 2.34.2. Os três links diretos responderam HTTP 200; cabeçalhos foram inspecionados em pequenas amostras dos ZIPs oficiais. Não foi realizada nesta entrega a carga integral e conciliação dos votos reais. A aplicação faz essa conferência após baixar os arquivos.
+Em 09/10/2026: 20 testes passaram (incluindo interface vazia e navegação com dados sintéticos). Ambiente: Python 3.13.2, pandas 2.3.3, Streamlit 1.65.0 e requests 2.34.2. Os três links diretos responderam HTTP 200; cabeçalhos foram inspecionados em pequenas amostras dos ZIPs oficiais. Não foi realizada nesta entrega a carga integral e conciliação dos votos reais. A aplicação faz essa conferência após baixar os arquivos.
 
 ## Menu de cargos
 
@@ -79,4 +79,14 @@ Presidente usa o recurso nacional de seções do TSE, filtrando SG_UF=SP, e o me
 
 Fonte presidencial: https://dadosabertos.tse.jus.br/dataset/resultados-2026 (recurso Presidente — Votação por seção eleitoral — 2026). URL: https://cdn.tse.jus.br/estatistica/sead/odsele/votacao_secao/votacao_secao_2026_BR.zip . A seleção de BR tem prioridade sobre SP apenas na leitura presidencial.
 
-Os 17 testes incluem filtros dos quatro cargos, exclusão de outras UFs/turnos, segundo turno presidencial, seleção do membro BR para totais e troca de cargos na interface. A extensão presidencial foi testada com dados sintéticos; a carga integral dos dados reais continua não realizada nesta entrega.
+Os 20 testes incluem filtros dos quatro cargos, exclusão de outras UFs/turnos, segundo turno presidencial, seleção do membro BR para totais e troca de cargos na interface. A extensão presidencial foi testada com dados sintéticos; a carga integral dos dados reais continua não realizada nesta entrega.
+
+## Desempenho e base rápida
+
+Votos e totalização são preparados em data/indices, usando SQLite da biblioteca padrão do Python (sem dependência adicional). Só colunas necessárias e registros de SP/2026 dos quatro cargos são guardados. Os índices são identificados por caminho, tamanho e data de modificação da fonte, tipo de base e versão do leitor. Uma atualização normal invalida automaticamente o índice. Não preserve artificialmente tamanho e horário ao substituir uma fonte. A preparação publica o índice somente após concluir e conferir que a fonte não mudou. Bases antigas ficam no disco: com o app parado, a pasta data/indices pode ser removida para liberar espaço ou forçar reconstrução.
+
+O cadastro de bairros tem cache independente por arquivo e turno. O cache de resultados é limitado a oito consultas e o de bairros a quatro entradas, evitando crescimento ilimitado em memória. Os índices continuam em disco após reiniciar o processo se o ambiente preservar a pasta; se o armazenamento for apagado, haverá nova preparação. A primeira consulta e o download ainda podem ser demorados, e preparar índices pode ser mais lento que uma única leitura antiga. É uma troca de custo inicial por consultas subsequentes rápidas, com necessidade de espaço adicional em disco.
+
+Medição local sintética (200 mil registros): leitura anterior 1,509 s; preparação + primeira consulta 2,643 s; outro candidato com índice pronto 0,027 s (56,5 vezes mais rápido nessa consulta). Resultados idênticos. Esse teste mede a leitura de votos, não download, renderização, carga completa do TSE ou desempenho da hospedagem. Reproduza com python benchmark.py.
+
+Os 20 testes também verificam igualdade entre leitores, reutilização sem reler o CSV, invalidação após atualização e preservação da detecção de duplicidades.

@@ -18,6 +18,36 @@ def fixture():
 
 
 class DataTests(unittest.TestCase):
+    def test_index_matches_original_and_reuses_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "votes.csv"
+            fixture().to_csv(path, sep=";", index=False)
+            expected = app.read_votes(path, "1234")
+            actual = app.read_votes_indexed(path, "1234")
+            pd.testing.assert_frame_equal(expected[0], actual[0])
+            self.assertEqual(expected[1:], actual[1:])
+            with patch.object(app, "chunks", side_effect=AssertionError("Não deve reler CSV")):
+                self.assertEqual(app.read_votes_indexed(path, "5678")[0].Votos.sum(), 30)
+            fixture().assign(QT_VOTOS="100").to_csv(path, sep=";", index=False)
+            self.assertEqual(app.read_votes_indexed(path, "1234")[0].Votos.sum(), 200)
+
+    def test_index_preserves_duplicate_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "votes.csv"
+            pd.concat([fixture(), fixture()]).to_csv(path, sep=";", index=False)
+            with self.assertRaisesRegex(ValueError, "duplicados"):
+                app.read_votes_indexed(path, "1234")
+
+    def test_indexed_totals_match_and_reuse(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "totals.csv"
+            fixture().iloc[[0]].assign(NR_CANDIDATO="1234", QT_VOTOS_NOMINAIS="30").to_csv(path, sep=";", index=False)
+            expected = app.read_totals(path, "1234", "999")
+            actual = app.read_totals(path, "1234", "999", indexed=True)
+            pd.testing.assert_frame_equal(expected, actual)
+            with patch.object(app, "chunks", side_effect=AssertionError("Não deve reler CSV")):
+                pd.testing.assert_frame_equal(actual, app.read_totals(path, "1234", "999", indexed=True))
+
     def test_each_office_and_turn_filters(self):
         for label, (cargo, digits) in app.CARGOS.items():
             number = "1" * digits
