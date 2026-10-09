@@ -18,53 +18,26 @@ def fixture():
 
 
 class DataTests(unittest.TestCase):
-    def test_preparation_only_selected_cargo_and_reused(self):
+    def test_get_files_does_not_parse_or_index(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             fixture().to_csv(root / "secoes.csv", sep=";", index=False)
-            fixture().assign(CD_CARGO="1", NR_VOTAVEL="11").to_csv(root / "secoes_presidente.csv", sep=";", index=False)
-            with patch.object(app, "DATA", root):
-                ready, errors, stamp = app.prepare_cargo("6", fetch=False)
-                self.assertIn(("secoes", False), ready)
-                self.assertNotIn(("secoes_presidente", True), ready)
-                self.assertEqual(len(list((root / "indices").glob("*.sqlite"))), 1)
-                self.assertTrue(errors)  # Optional sources absent, no fabricated mapping.
-                with patch.object(app, "chunks", side_effect=AssertionError("Não deve reler")):
-                    ready2, _, stamp2 = app.prepare_cargo("6", fetch=False)
-                self.assertEqual(ready, ready2)
-                self.assertEqual(stamp, stamp2)
-                app.prepare_cargo("1", fetch=False)
-                self.assertEqual(len(list((root / "indices").glob("*.sqlite"))), 2)
+            with patch.object(app, "DATA", root), patch.object(app, "chunks", side_effect=AssertionError("Não deve pré-processar")):
+                ready, _, _ = app.prepare_cargo("6", fetch=False)
+            self.assertIn(("secoes", False), ready)
+            self.assertFalse((root / "indices").exists())
 
-    def test_index_matches_original_and_reuses_source(self):
+    def test_direct_query_result_cached(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "votes.csv"
+            root = Path(directory)
+            path = root / "secoes.csv"
             fixture().to_csv(path, sep=";", index=False)
-            expected = app.read_votes(path, "1234")
-            actual = app.read_votes_indexed(path, "1234")
-            pd.testing.assert_frame_equal(expected[0], actual[0])
-            self.assertEqual(expected[1:], actual[1:])
-            with patch.object(app, "chunks", side_effect=AssertionError("Não deve reler CSV")):
-                self.assertEqual(app.read_votes_indexed(path, "5678")[0].Votos.sum(), 30)
-            fixture().assign(QT_VOTOS="100").to_csv(path, sep=";", index=False)
-            self.assertEqual(app.read_votes_indexed(path, "1234")[0].Votos.sum(), 200)
-
-    def test_index_preserves_duplicate_failure(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "votes.csv"
-            pd.concat([fixture(), fixture()]).to_csv(path, sep=";", index=False)
-            with self.assertRaisesRegex(ValueError, "duplicados"):
-                app.read_votes_indexed(path, "1234")
-
-    def test_indexed_totals_match_and_reuse(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "totals.csv"
-            fixture().iloc[[0]].assign(NR_CANDIDATO="1234", QT_VOTOS_NOMINAIS="30").to_csv(path, sep=";", index=False)
-            expected = app.read_totals(path, "1234", "999")
-            actual = app.read_totals(path, "1234", "999", indexed=True)
-            pd.testing.assert_frame_equal(expected, actual)
-            with patch.object(app, "chunks", side_effect=AssertionError("Não deve reler CSV")):
-                pd.testing.assert_frame_equal(actual, app.read_totals(path, "1234", "999", indexed=True))
+            with patch.object(app, "DATA", root):
+                signature = app.source_signature("6")
+                result = app.load_cached("1234", signature)
+                self.assertEqual(result[0].Votos.sum(), 30)
+                with patch.object(app, "chunks", side_effect=AssertionError("Consulta repetida não deve reler")):
+                    self.assertEqual(app.load_cached("1234", signature)[0].Votos.sum(), 30)
 
     def test_each_office_and_turn_filters(self):
         for label, (cargo, digits) in app.CARGOS.items():
@@ -216,16 +189,6 @@ class DataTests(unittest.TestCase):
                 at.button(key="cargo_6").click().run()
             self.assertFalse(at.exception)
             self.assertEqual(at.text_input(key="numero_6").value, "1111")
-
-    def test_index_contains_only_clicked_office(self):
-        import sqlite3
-        from contextlib import closing
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "votes.csv"
-            pd.concat([fixture(), fixture().assign(CD_CARGO="7")]).to_csv(path, sep=";", index=False)
-            database = app.prepare_index(path, "votes", cargo="6")
-            with closing(sqlite3.connect(database)) as conn:
-                self.assertEqual(conn.execute("SELECT DISTINCT CD_CARGO FROM records").fetchall(), [("6",)])
 
 
 if __name__ == "__main__":
